@@ -17,12 +17,12 @@ impl FileSource {
         // Debug: print ffmpeg command
         println!("Debug: FFmpeg command:");
         println!("  ffmpeg -re -stream_loop -1 -i {:?} -an -c:v libx264 -preset ultrafast -tune zerolatency -f h264 pipe:1", &self.file_path);
-        
+
         // Check if ffmpeg exists
         let ffmpeg_check = Command::new("which")
             .arg("ffmpeg")
             .output();
-        
+
         match ffmpeg_check {
             Ok(output) => {
                 if output.status.success() {
@@ -34,11 +34,11 @@ impl FileSource {
             }
             Err(e) => println!("Debug: Error checking ffmpeg: {}", e),
         }
-        
+
         // Check if input file exists
         println!("Debug: Input file path: {:?}", &self.file_path);
         println!("Debug: File exists: {}", std::path::Path::new(&self.file_path).exists());
-        
+
         let child = Command::new("ffmpeg")
             .args(&[
                 "-re",                          // Real-time mode
@@ -48,7 +48,11 @@ impl FileSource {
                 "-c:v", "libx264",              // H.264 codec
                 "-preset", "ultrafast",         // Encode nhanh
                 "-tune", "zerolatency",         // Low latency
+                "-profile:v", "baseline",       // Baseline profile cho compatibility
+                "-g", "60",                     // GOP size (keyframe interval)
+                "-bf", "0",                     // No B-frames cho low latency
                 "-f", "h264",                   // Format H.264 raw
+                "-bsf:v", "h264_mp4toannexb",  // Ensure Annex-B format
                 "pipe:1"                        // Output to stdout
             ])
             .stdout(Stdio::piped())

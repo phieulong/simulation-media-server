@@ -5,6 +5,7 @@ mod rtcp;
 
 use std::env;
 use rtsp::server::RtspServer;
+use rtsp::state::{SharedState, create_shared_state};
 use rtp::h264::H264Packetizer;
 use rtcp::sr::SenderReport;
 use source::file::{FileSource, NaluParser};
@@ -19,9 +20,12 @@ async fn main() {
     println!("🚀 Simulation Media Server Starting...");
     println!("=====================================");
     
+    // Create shared state
+    let state = create_shared_state();
+
     // Start RTSP server
-    let rtsp_server = RtspServer::new("0.0.0.0:8554".to_string());
-    
+    let rtsp_server = RtspServer::new("0.0.0.0:8554".to_string(), state.clone());
+
     let rtsp_handle = tokio::spawn(async move {
         if let Err(e) = rtsp_server.run().await {
             eprintln!("❌ RTSP Server error: {}", e);
@@ -31,6 +35,7 @@ async fn main() {
     println!("Application run on: {} ", env::current_dir().unwrap().display());
 
     // Start RTP/RTCP streaming task
+    let streaming_state = state.clone();
     let streaming_handle = tokio::spawn(async move {
         // Đợi một chút để RTSP server khởi động
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -39,7 +44,7 @@ async fn main() {
         println!("=====================================");
         
         // Khởi động video source
-        if let Err(e) = start_video_streaming().await {
+        if let Err(e) = start_video_streaming(streaming_state).await {
             eprintln!("❌ Video streaming error: {}", e);
         }
     });
@@ -49,7 +54,7 @@ async fn main() {
 }
 
 /// Start video streaming từ MP4 file
-async fn start_video_streaming() -> std::io::Result<()> {
+async fn start_video_streaming(state: SharedState) -> std::io::Result<()> {
     let video_path = "./videos/example.mp4";
 
     println!("Debug: requested video_path = {:?}", video_path);
@@ -93,10 +98,8 @@ async fn start_video_streaming() -> std::io::Result<()> {
     if let Some(mut stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut buf = String::new();
-            if let Ok(_) = stderr.read_to_string(&mut buf) {
-                if !buf.is_empty() {
-                    println!("Debug: FFmpeg stderr output:\n{}", buf);
-                }
+            if stderr.read_to_string(&mut buf).is_ok() && !buf.is_empty() {
+                println!("Debug: FFmpeg stderr output:\n{}", buf);
             }
         });
     }
@@ -123,9 +126,6 @@ async fn start_video_streaming() -> std::io::Result<()> {
     println!("📡 RTP socket: 0.0.0.0:6000");
     println!("📡 RTCP socket: 0.0.0.0:6001");
 
-    // Default client address (sẽ được update khi có SETUP request)
-    let client_addr = "127.0.0.1:5004";
-
     // RTP Packetizer
     let packetizer = Arc::new(Mutex::new(H264Packetizer::new(0x12345678)));
     println!("Packetizer address: {:p}", Arc::as_ptr(&packetizer));
@@ -137,6 +137,7 @@ async fn start_video_streaming() -> std::io::Result<()> {
     // Spawn RTCP sender (gửi SR mỗi 5 giây)
     let rtcp_socket_clone = rtcp_socket.clone();
     let sender_report_clone = sender_report.clone();
+    let state_clone = state.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -144,11 +145,15 @@ async fn start_video_streaming() -> std::io::Result<()> {
             let sr = sender_report_clone.lock().await;
             let sr_packet = sr.to_bytes();
 
-            // Gửi đến client
-            if let Err(e) = rtcp_socket_clone.send_to(&sr_packet, client_addr).await {
-                eprintln!("⚠️  RTCP send error: {}", e);
-            } else {
-                println!("📊 RTCP SR sent - packets: {}, bytes: {}", sr.packet_count, sr.octet_count);
+            // Gửi đến tất cả UDP playing clients
+            let udp_clients = state_clone.read().await.get_udp_clients();
+            for (_rtp_addr, rtcp_addr) in udp_clients {
+                if let Err(e) = rtcp_socket_clone.send_to(&sr_packet, rtcp_addr).await {
+                    eprintln!("⚠️  RTCP send error to {}: {}", rtcp_addr, e);
+                } else {
+                    println!("📊 RTCP SR sent to {} - packets: {}, bytes: {}",
+                             rtcp_addr, sr.packet_count, sr.octet_count);
+                }
             }
         }
     });
@@ -159,7 +164,11 @@ async fn start_video_streaming() -> std::io::Result<()> {
     let mut buffer = [0u8; 8192];
 
     let mut frame_count = 0u64;
-    let timestamp_increment = 3000u32; // 90000 Hz / 30 fps = 3000
+
+    // Cache SPS/PPS để gửi cho new clients
+    let mut sps: Option<Vec<u8>> = None;
+    let mut pps: Option<Vec<u8>> = None;
+    let mut last_udp_clients_count = 0;
 
     loop {
         // Đọc data từ FFmpeg
@@ -172,12 +181,66 @@ async fn start_video_streaming() -> std::io::Result<()> {
                 // Parse NALUs
                 let nalus = parser.parse(&buffer[..n]);
 
+                if nalus.is_empty() {
+                    continue;
+                }
+
+                // Get UDP playing clients (TCP clients are handled by their own sessions)
+                let udp_clients = state.read().await.get_udp_clients();
+
+                if udp_clients.is_empty() {
+                    // No UDP clients playing, just consume the data
+                    continue;
+                }
+
+                // Detect new clients and send SPS/PPS
+                if udp_clients.len() > last_udp_clients_count {
+                    if let (Some(ref sps_data), Some(ref pps_data)) = (&sps, &pps) {
+                        println!("📡 New UDP client detected, sending SPS/PPS");
+
+                        // Send SPS
+                        let mut pac = packetizer.lock().await;
+                        let sps_packets = pac.packetize(sps_data, false);
+                        for packet in sps_packets {
+                            let data = packet.to_bytes();
+                            for (rtp_addr, _) in &udp_clients {
+                                let _ = rtp_socket.send_to(&data, rtp_addr).await;
+                            }
+                        }
+
+                        // Send PPS
+                        let pps_packets = pac.packetize(pps_data, false);
+                        for packet in pps_packets {
+                            let data = packet.to_bytes();
+                            for (rtp_addr, _) in &udp_clients {
+                                let _ = rtp_socket.send_to(&data, rtp_addr).await;
+                            }
+                        }
+                    }
+                }
+                last_udp_clients_count = udp_clients.len();
+
+                // Process NALUs
                 for (i, nalu) in nalus.iter().enumerate() {
                     if nalu.is_empty() {
                         continue;
                     }
 
                     let nalu_type = nalu[0] & 0x1F;
+
+                    // Cache SPS (type 7) and PPS (type 8)
+                    match nalu_type {
+                        7 => {
+                            sps = Some(nalu.clone());
+                            println!("📦 Cached SPS (size: {} bytes)", nalu.len());
+                        }
+                        8 => {
+                            pps = Some(nalu.clone());
+                            println!("📦 Cached PPS (size: {} bytes)", nalu.len());
+                        }
+                        _ => {}
+                    }
+
                     let is_keyframe = nalu_type == 5 || nalu_type == 7 || nalu_type == 8;
 
                     // Packetize NALU
@@ -185,13 +248,15 @@ async fn start_video_streaming() -> std::io::Result<()> {
                     let mut pac = packetizer.lock().await;
                     let packets = pac.packetize(nalu, is_last);
 
-                    // Gửi các RTP packets
+                    // Gửi các RTP packets đến tất cả UDP playing clients
                     for packet in packets {
                         let data = packet.to_bytes();
                         let size = data.len();
 
-                        if let Err(e) = rtp_socket.send_to(&data, client_addr).await {
-                            eprintln!("⚠️  RTP send error: {}", e);
+                        for (rtp_addr, _rtcp_addr) in &udp_clients {
+                            if let Err(e) = rtp_socket.send_to(&data, rtp_addr).await {
+                                eprintln!("⚠️  RTP send error to {}: {}", rtp_addr, e);
+                            }
                         }
 
                         // Update RTCP statistics
@@ -202,17 +267,18 @@ async fn start_video_streaming() -> std::io::Result<()> {
                     if is_keyframe {
                         frame_count += 1;
                         if frame_count % 30 == 0 {
-                            println!("🎬 Sent {} frames (NALU type: {})", frame_count, nalu_type);
+                            println!("🎬 Sent {} frames to {} UDP client(s) (NALU type: {})",
+                                     frame_count, udp_clients.len(), nalu_type);
                         }
                     }
                 }
 
-                // Increment timestamp for next frame
+                // Increment timestamp ONCE per frame group
+                // Since we're using -re flag, FFmpeg outputs in real-time
+                // We use 3000 ticks (90000Hz / 30fps) as default, but this will be
+                // naturally paced by FFmpeg's -re flag
                 let mut pac = packetizer.lock().await;
-                pac.increment_timestamp(timestamp_increment);
-
-                // Sleep để simulate frame rate (~30fps)
-                tokio::time::sleep(Duration::from_millis(33)).await;
+                pac.increment_timestamp(3000);
             }
             Err(e) => {
                 eprintln!("❌ Read error: {}", e);
@@ -226,6 +292,4 @@ async fn start_video_streaming() -> std::io::Result<()> {
 
     Ok(())
 }
-
-
 

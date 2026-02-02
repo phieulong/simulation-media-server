@@ -3,6 +3,7 @@ mod rtsp;
 mod rtp;
 mod rtcp;
 
+use std::env;
 use rtsp::server::RtspServer;
 use rtp::h264::H264Packetizer;
 use rtcp::sr::SenderReport;
@@ -27,11 +28,13 @@ async fn main() {
         }
     });
 
+    println!("Application run on: {} ", env::current_dir().unwrap().display());
+
     // Start RTP/RTCP streaming task
     let streaming_handle = tokio::spawn(async move {
         // Đợi một chút để RTSP server khởi động
         tokio::time::sleep(Duration::from_secs(2)).await;
-        
+
         println!("\n📹 Starting video streaming...");
         println!("=====================================");
         
@@ -47,12 +50,27 @@ async fn main() {
 
 /// Start video streaming từ MP4 file
 async fn start_video_streaming() -> std::io::Result<()> {
-    let video_path = "videos/example.mp4";
+    let video_path = "./videos/example.mp4";
+
+    println!("Debug: requested video_path = {:?}", video_path);
 
     // Check if file exists
     if !std::path::Path::new(video_path).exists() {
         eprintln!("⚠️  Video file not found: {}", video_path);
-        eprintln!("   Server will run but no video stream available");
+        // Extra debug: show pointer to Path, and list contents of `videos/` folder if present
+        let p = std::path::Path::new(video_path);
+        println!("Debug: Path::new ptr = {:p}", p);
+        match std::fs::read_dir("videos") {
+            Ok(entries) => {
+                println!("Debug: listing 'videos/' directory contents:");
+                for entry in entries.flatten() {
+                    println!("  - {:?}", entry.file_name());
+                }
+            }
+            Err(e) => println!("Debug: cannot read 'videos/' dir: {}", e),
+        }
+
+        println!("   Server will run but no video stream available");
         println!("✅ Ready to accept RTSP connections");
         println!("   URL: rtsp://127.0.0.1:8554/cam");
 
@@ -69,9 +87,25 @@ async fn start_video_streaming() -> std::io::Result<()> {
 
     // Start FFmpeg process
     let mut child = source.start_ffmpeg()?;
+    println!("Debug: FileSource addr = {:p}", &source);
+
+    // Đọc stderr trong background thread để không block
+    if let Some(mut stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            if let Ok(_) = stderr.read_to_string(&mut buf) {
+                if !buf.is_empty() {
+                    println!("Debug: FFmpeg stderr output:\n{}", buf);
+                }
+            }
+        });
+    }
+
     let stdout = child.stdout.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture FFmpeg stdout")
     })?;
+    println!("Debug: Child process addr = {:p}", &child);
+    println!("Debug: FFmpeg stdout (ChildStdout) addr = {:p}", &stdout as *const _);
 
     println!("✅ FFmpeg started");
     println!("✅ Ready to accept RTSP connections");
@@ -82,7 +116,9 @@ async fn start_video_streaming() -> std::io::Result<()> {
 
     // Setup UDP sockets cho RTP/RTCP
     let rtp_socket = Arc::new(UdpSocket::bind("0.0.0.0:6000").await?);
+    println!("RTP socket address: {:p}", Arc::as_ptr(&rtp_socket));
     let rtcp_socket = Arc::new(UdpSocket::bind("0.0.0.0:6001").await?);
+    println!("RTCP socket address: {:p}", Arc::as_ptr(&rtcp_socket));
 
     println!("📡 RTP socket: 0.0.0.0:6000");
     println!("📡 RTCP socket: 0.0.0.0:6001");
@@ -92,9 +128,11 @@ async fn start_video_streaming() -> std::io::Result<()> {
 
     // RTP Packetizer
     let packetizer = Arc::new(Mutex::new(H264Packetizer::new(0x12345678)));
+    println!("Packetizer address: {:p}", Arc::as_ptr(&packetizer));
 
     // RTCP Sender Report
     let sender_report = Arc::new(Mutex::new(SenderReport::new(0x12345678)));
+    println!("Sender report address: {:p}", Arc::as_ptr(&sender_report));
 
     // Spawn RTCP sender (gửi SR mỗi 5 giây)
     let rtcp_socket_clone = rtcp_socket.clone();
@@ -188,4 +226,6 @@ async fn start_video_streaming() -> std::io::Result<()> {
 
     Ok(())
 }
+
+
 

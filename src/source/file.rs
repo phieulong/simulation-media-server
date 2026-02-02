@@ -14,6 +14,31 @@ impl FileSource {
     /// Tạo FFmpeg process để encode file MP4 thành H.264 raw stream
     /// Output: H.264 NALUs qua stdout
     pub fn start_ffmpeg(&self) -> std::io::Result<std::process::Child> {
+        // Debug: print ffmpeg command
+        println!("Debug: FFmpeg command:");
+        println!("  ffmpeg -re -stream_loop -1 -i {:?} -an -c:v libx264 -preset ultrafast -tune zerolatency -f h264 pipe:1", &self.file_path);
+        
+        // Check if ffmpeg exists
+        let ffmpeg_check = Command::new("which")
+            .arg("ffmpeg")
+            .output();
+        
+        match ffmpeg_check {
+            Ok(output) => {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout);
+                    println!("Debug: FFmpeg found at: {}", path.trim());
+                } else {
+                    println!("Debug: FFmpeg NOT found in PATH");
+                }
+            }
+            Err(e) => println!("Debug: Error checking ffmpeg: {}", e),
+        }
+        
+        // Check if input file exists
+        println!("Debug: Input file path: {:?}", &self.file_path);
+        println!("Debug: File exists: {}", std::path::Path::new(&self.file_path).exists());
+        
         let child = Command::new("ffmpeg")
             .args(&[
                 "-re",                          // Real-time mode
@@ -27,7 +52,7 @@ impl FileSource {
                 "pipe:1"                        // Output to stdout
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())             // Capture stderr để xem lỗi
             .spawn()?;
 
         Ok(child)

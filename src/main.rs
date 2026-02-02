@@ -169,6 +169,7 @@ async fn start_video_streaming(state: SharedState) -> std::io::Result<()> {
     let mut sps: Option<Vec<u8>> = None;
     let mut pps: Option<Vec<u8>> = None;
     let mut last_udp_clients_count = 0;
+    let mut sps_pps_sent = false; // Track if we've sent initial SPS/PPS
 
     loop {
         // Đọc data từ FFmpeg
@@ -220,65 +221,163 @@ async fn start_video_streaming(state: SharedState) -> std::io::Result<()> {
                 }
                 last_udp_clients_count = udp_clients.len();
 
-                // Process NALUs
+                // Group NALUs into access units (frames)
+                // An access unit ends when we see a new IDR/SPS, or at end of NALU list
+                let mut access_unit_indices = vec![];
+                let mut current_au_start = 0;
+
                 for (i, nalu) in nalus.iter().enumerate() {
                     if nalu.is_empty() {
                         continue;
                     }
-
                     let nalu_type = nalu[0] & 0x1F;
 
-                    // Cache SPS (type 7) and PPS (type 8)
-                    match nalu_type {
-                        7 => {
-                            sps = Some(nalu.clone());
-                            println!("📦 Cached SPS (size: {} bytes)", nalu.len());
-                        }
-                        8 => {
-                            pps = Some(nalu.clone());
-                            println!("📦 Cached PPS (size: {} bytes)", nalu.len());
-                        }
-                        _ => {}
-                    }
-
-                    let is_keyframe = nalu_type == 5 || nalu_type == 7 || nalu_type == 8;
-
-                    // Packetize NALU
-                    let is_last = i == nalus.len() - 1;
-                    let mut pac = packetizer.lock().await;
-                    let packets = pac.packetize(nalu, is_last);
-
-                    // Gửi các RTP packets đến tất cả UDP playing clients
-                    for packet in packets {
-                        let data = packet.to_bytes();
-                        let size = data.len();
-
-                        for (rtp_addr, _rtcp_addr) in &udp_clients {
-                            if let Err(e) = rtp_socket.send_to(&data, rtp_addr).await {
-                                eprintln!("⚠️  RTP send error to {}: {}", rtp_addr, e);
-                            }
-                        }
-
-                        // Update RTCP statistics
-                        let mut sr = sender_report.lock().await;
-                        sr.add_packet(size);
-                    }
-
-                    if is_keyframe {
-                        frame_count += 1;
-                        if frame_count % 30 == 0 {
-                            println!("🎬 Sent {} frames to {} UDP client(s) (NALU type: {})",
-                                     frame_count, udp_clients.len(), nalu_type);
-                        }
+                    // New access unit starts at SPS (7), IDR (5), or I-frame (not after PPS)
+                    if i > 0 && (nalu_type == 7 || (nalu_type == 5 && i > current_au_start + 2)) {
+                        access_unit_indices.push((current_au_start, i));
+                        current_au_start = i;
                     }
                 }
+                // Add last access unit
+                if current_au_start < nalus.len() {
+                    access_unit_indices.push((current_au_start, nalus.len()));
+                }
 
-                // Increment timestamp ONCE per frame group
-                // Since we're using -re flag, FFmpeg outputs in real-time
-                // We use 3000 ticks (90000Hz / 30fps) as default, but this will be
-                // naturally paced by FFmpeg's -re flag
-                let mut pac = packetizer.lock().await;
-                pac.increment_timestamp(3000);
+                // Process each access unit
+                for (au_idx, (au_start, au_end)) in access_unit_indices.iter().enumerate() {
+                    let is_last_au = au_idx == access_unit_indices.len() - 1;
+
+                    // Process NALUs in this access unit
+                    for i in *au_start..*au_end {
+                        let nalu = &nalus[i];
+                        if nalu.is_empty() {
+                            continue;
+                        }
+
+                        let nalu_type = nalu[0] & 0x1F;
+
+                        // Cache SPS (type 7) and PPS (type 8)
+                        match nalu_type {
+                            7 => {
+                                sps = Some(nalu.clone());
+                                println!("📦 Cached SPS (size: {} bytes)", nalu.len());
+
+                                // If we have both SPS and PPS and haven't sent yet, send to all clients
+                                if !sps_pps_sent && pps.is_some() && !udp_clients.is_empty() {
+                                    println!("🚀 Sending initial SPS/PPS to UDP clients");
+                                    let mut pac = packetizer.lock().await;
+                                    let sps_packets = pac.packetize(nalu, false);
+                                    for packet in sps_packets {
+                                        let data = packet.to_bytes();
+                                        for (rtp_addr, _) in &udp_clients {
+                                            let _ = rtp_socket.send_to(&data, rtp_addr).await;
+                                        }
+                                    }
+                                    // Send PPS
+                                    if let Some(ref pps_data) = pps {
+                                        let pps_packets = pac.packetize(pps_data, false);
+                                        for packet in pps_packets {
+                                            let data = packet.to_bytes();
+                                            for (rtp_addr, _) in &udp_clients {
+                                                let _ = rtp_socket.send_to(&data, rtp_addr).await;
+                                            }
+                                        }
+                                    }
+                                    sps_pps_sent = true;
+                                }
+                            }
+                            8 => {
+                                pps = Some(nalu.clone());
+                                println!("📦 Cached PPS (size: {} bytes)", nalu.len());
+
+                                // If we have both SPS and PPS and haven't sent yet, send to all clients
+                                if !sps_pps_sent && sps.is_some() && !udp_clients.is_empty() {
+                                    println!("🚀 Sending initial SPS/PPS to UDP clients");
+                                    let mut pac = packetizer.lock().await;
+                                    // Send SPS
+                                    if let Some(ref sps_data) = sps {
+                                        let sps_packets = pac.packetize(sps_data, false);
+                                        for packet in sps_packets {
+                                            let data = packet.to_bytes();
+                                            for (rtp_addr, _) in &udp_clients {
+                                                let _ = rtp_socket.send_to(&data, rtp_addr).await;
+                                            }
+                                        }
+                                    }
+                                    // Send PPS
+                                    let pps_packets = pac.packetize(nalu, false);
+                                    for packet in pps_packets {
+                                        let data = packet.to_bytes();
+                                        for (rtp_addr, _) in &udp_clients {
+                                            let _ = rtp_socket.send_to(&data, rtp_addr).await;
+                                        }
+                                    }
+                                    sps_pps_sent = true;
+                                }
+                            }
+                            5 => {
+                                // IDR frame - always resend SPS/PPS before it
+                                if let (Some(ref sps_data), Some(ref pps_data)) = (&sps, &pps) {
+                                    let mut pac = packetizer.lock().await;
+                                    // Send SPS
+                                    let sps_packets = pac.packetize(sps_data, false);
+                                    for packet in sps_packets {
+                                        let data = packet.to_bytes();
+                                        for (rtp_addr, _) in &udp_clients {
+                                            let _ = rtp_socket.send_to(&data, rtp_addr).await;
+                                        }
+                                    }
+                                    // Send PPS
+                                    let pps_packets = pac.packetize(pps_data, false);
+                                    for packet in pps_packets {
+                                        let data = packet.to_bytes();
+                                        for (rtp_addr, _) in &udp_clients {
+                                            let _ = rtp_socket.send_to(&data, rtp_addr).await;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        let is_keyframe = nalu_type == 5;
+
+                        // Marker bit is set on the last NALU of the access unit
+                        let is_last_nalu_in_au = i == *au_end - 1;
+
+                        let mut pac = packetizer.lock().await;
+                        let packets = pac.packetize(nalu, is_last_nalu_in_au);
+
+                        // Gửi các RTP packets đến tất cả UDP playing clients
+                        for packet in packets {
+                            let data = packet.to_bytes();
+                            let size = data.len();
+
+                            for (rtp_addr, _rtcp_addr) in &udp_clients {
+                                if let Err(e) = rtp_socket.send_to(&data, rtp_addr).await {
+                                    eprintln!("⚠️  RTP send error to {}: {}", rtp_addr, e);
+                                }
+                            }
+
+                            // Update RTCP statistics
+                            let mut sr = sender_report.lock().await;
+                            sr.add_packet(size);
+                        }
+
+                        if is_keyframe {
+                            frame_count += 1;
+                            if frame_count % 30 == 0 {
+                                println!("🎬 Sent {} frames to {} UDP client(s)",
+                                         frame_count, udp_clients.len());
+                            }
+                        }
+                    }
+
+                    // Increment timestamp ONCE per access unit (frame)
+                    // 90000 Hz / 30 fps = 3000 ticks per frame
+                    let mut pac = packetizer.lock().await;
+                    pac.increment_timestamp(3000);
+                }
             }
             Err(e) => {
                 eprintln!("❌ Read error: {}", e);

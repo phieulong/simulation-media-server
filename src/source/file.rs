@@ -49,8 +49,12 @@ impl FileSource {
                 "-preset", "ultrafast",         // Encode nhanh
                 "-tune", "zerolatency",         // Low latency
                 "-profile:v", "baseline",       // Baseline profile cho compatibility
-                "-g", "60",                     // GOP size (keyframe interval)
+                "-level", "3.1",                // H.264 level 3.1
+                "-pix_fmt", "yuv420p",          // Pixel format
+                "-g", "30",                     // GOP size (keyframe every 30 frames)
+                "-keyint_min", "30",            // Minimum keyframe interval
                 "-bf", "0",                     // No B-frames cho low latency
+                "-x264-params", "nal-hrd=cbr:force-cfr=1", // Constant bitrate for stable streaming
                 "-f", "h264",                   // Format H.264 raw
                 "-bsf:v", "h264_mp4toannexb",  // Ensure Annex-B format
                 "pipe:1"                        // Output to stdout
@@ -81,55 +85,59 @@ impl NaluParser {
         self.buffer.extend_from_slice(data);
         let mut nalus = Vec::new();
         
-        // Tìm start code: 0x00 0x00 0x00 0x01 hoặc 0x00 0x00 0x01
-        let mut pos = 0;
-        while pos < self.buffer.len() {
-            if let Some(start) = self.find_start_code(pos) {
-                if pos > 0 && pos != start {
-                    // Có NALU từ vị trí trước đến start code này
-                    let nalu = self.buffer[pos..start].to_vec();
-                    if !nalu.is_empty() {
+        let mut i = 0;
+        while i < self.buffer.len() {
+            // Find start code at position i
+            if let Some((sc_start, sc_len)) = self.find_start_code_at(i) {
+                // Found a start code, now find the next one
+                let nalu_start = sc_start + sc_len;
+
+                if let Some((next_sc_start, _)) = self.find_start_code_at(nalu_start) {
+                    // Found next start code, extract NALU between them
+                    let nalu = self.buffer[nalu_start..next_sc_start].to_vec();
+                    if !nalu.is_empty() && nalu.len() > 0 {
                         nalus.push(nalu);
                     }
-                }
-                
-                // Skip start code (3 hoặc 4 bytes)
-                pos = start;
-                if pos + 3 < self.buffer.len() 
-                    && self.buffer[pos..pos+4] == [0, 0, 0, 1] {
-                    pos += 4;
-                } else if pos + 2 < self.buffer.len() 
-                    && self.buffer[pos..pos+3] == [0, 0, 1] {
-                    pos += 3;
+                    i = next_sc_start;
                 } else {
-                    pos += 1;
+                    // No more start codes, keep remaining in buffer
+                    self.buffer = self.buffer[sc_start..].to_vec();
+                    break;
                 }
             } else {
+                // No start code found, keep everything in buffer
                 break;
             }
         }
-        
-        // Giữ lại phần chưa parse được
-        if pos < self.buffer.len() {
-            self.buffer = self.buffer[pos..].to_vec();
-        } else {
+
+        // If we processed all, clear buffer
+        if i > 0 && i >= self.buffer.len() {
             self.buffer.clear();
         }
         
         nalus
     }
 
-    fn find_start_code(&self, start: usize) -> Option<usize> {
+    fn find_start_code_at(&self, start: usize) -> Option<(usize, usize)> {
+        if start >= self.buffer.len() {
+            return None;
+        }
+
         for i in start..self.buffer.len().saturating_sub(3) {
-            // 4-byte start code
-            if self.buffer[i] == 0 && self.buffer[i+1] == 0 
-                && self.buffer[i+2] == 0 && self.buffer[i+3] == 1 {
-                return Some(i);
+            // 4-byte start code: 0x00 0x00 0x00 0x01
+            if i + 3 < self.buffer.len()
+                && self.buffer[i] == 0
+                && self.buffer[i+1] == 0
+                && self.buffer[i+2] == 0
+                && self.buffer[i+3] == 1 {
+                return Some((i, 4));
             }
-            // 3-byte start code
-            if self.buffer[i] == 0 && self.buffer[i+1] == 0 
+            // 3-byte start code: 0x00 0x00 0x01
+            if i + 2 < self.buffer.len()
+                && self.buffer[i] == 0
+                && self.buffer[i+1] == 0
                 && self.buffer[i+2] == 1 {
-                return Some(i);
+                return Some((i, 3));
             }
         }
         None

@@ -130,6 +130,7 @@ impl RtspSession {
         // Store SPS/PPS for re-sending before IDR
         let mut cached_sps: Option<Vec<u8>> = None;
         let mut cached_pps: Option<Vec<u8>> = None;
+        let mut sps_pps_sent = false; // Track if we've sent initial SPS/PPS
 
         loop {
             // Check if client is still playing
@@ -166,12 +167,48 @@ impl RtspSession {
                             7 => { // SPS
                                 cached_sps = Some(nalu.clone());
                                 println!("📋 Cached SPS ({} bytes)", nalu.len());
+                                
+                                // If we have both SPS and PPS, and haven't sent them yet, send immediately
+                                if !sps_pps_sent && cached_pps.is_some() {
+                                    println!("🚀 Sending initial SPS/PPS to client");
+                                    // Send SPS
+                                    let packets = packetizer.packetize(nalu, false);
+                                    for packet in packets {
+                                        self.send_interleaved_rtp(&packet.to_bytes(), rtp_channel).await?;
+                                    }
+                                    // Send PPS
+                                    if let Some(ref pps) = cached_pps {
+                                        let packets = packetizer.packetize(pps, false);
+                                        for packet in packets {
+                                            self.send_interleaved_rtp(&packet.to_bytes(), rtp_channel).await?;
+                                        }
+                                    }
+                                    sps_pps_sent = true;
+                                }
                             }
                             8 => { // PPS
                                 cached_pps = Some(nalu.clone());
                                 println!("📋 Cached PPS ({} bytes)", nalu.len());
+                                
+                                // If we have both SPS and PPS, and haven't sent them yet, send immediately
+                                if !sps_pps_sent && cached_sps.is_some() {
+                                    println!("🚀 Sending initial SPS/PPS to client");
+                                    // Send SPS
+                                    if let Some(ref sps) = cached_sps {
+                                        let packets = packetizer.packetize(sps, false);
+                                        for packet in packets {
+                                            self.send_interleaved_rtp(&packet.to_bytes(), rtp_channel).await?;
+                                        }
+                                    }
+                                    // Send PPS
+                                    let packets = packetizer.packetize(nalu, false);
+                                    for packet in packets {
+                                        self.send_interleaved_rtp(&packet.to_bytes(), rtp_channel).await?;
+                                    }
+                                    sps_pps_sent = true;
+                                }
                             }
-                            5 => { // IDR - send SPS/PPS first
+                            5 => { // IDR - always send SPS/PPS first
                                 // Send cached SPS before IDR
                                 if let Some(ref sps) = cached_sps {
                                     let packets = packetizer.packetize(sps, false);
